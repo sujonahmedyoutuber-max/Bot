@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+bot_data.db
+.env
+venv/
+.DS_Store
