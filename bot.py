@@ -1,13 +1,15 @@
 """
-Telegram Task & Reward Bot - FULLY WORKING v2.0
-✅ Force Join properly works
-✅ All buttons work
+Telegram Task & Reward Bot - FULLY WORKING v3.0
+✅ Force Join FIXED - properly blocks until user joins all channels
+✅ All buttons work perfectly
 ✅ Admin panel fully functional
 ✅ Admin can add/remove withdraw methods with min/max limits
 ✅ Admin can set support contact
 ✅ Duplicate gift code use prevented
 ✅ Balance refunded on withdrawal rejection
-✅ Ready for Railway
+✅ Task submission with photo works
+✅ State machine fully fixed
+✅ Ready for Railway / VPS
 """
 
 import asyncio
@@ -19,8 +21,21 @@ import string
 from datetime import datetime
 
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 # ==================== CONFIGURATION ====================
 load_dotenv()
@@ -29,35 +44,85 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not set in .env file")
 
-ADMIN_USER_IDS = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
+ADMIN_USER_IDS = [
+    int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 DB_PATH = "bot_data.db"
 
+# ==================== STATE CONSTANTS ====================
+STATE_NONE = None
+
+# Withdraw states
+WD_METHOD   = "wd_method"
+WD_AMOUNT   = "wd_amount"
+WD_ACCOUNT  = "wd_account"
+
+# Redeem state
+REDEEM      = "redeem"
+
+# Task states
+TASK_LIST   = "task_list"
+TASK_PHOTO  = "task_photo"
+
+# Admin states
+ADMIN_ADD_TASK_TITLE   = "admin_add_task_title"
+ADMIN_ADD_TASK_DESC    = "admin_add_task_desc"
+ADMIN_ADD_TASK_LINK    = "admin_add_task_link"
+ADMIN_ADD_TASK_REWARD  = "admin_add_task_reward"
+ADMIN_REMOVE_TASK      = "admin_remove_task"
+ADMIN_PENDING_SUBS     = "admin_pending_subs"
+ADMIN_PENDING_WD       = "admin_pending_wd"
+ADMIN_GIFT_REWARD      = "admin_gift_reward"
+ADMIN_GIFT_LIMIT       = "admin_gift_limit"
+ADMIN_GIFT_EXPIRY      = "admin_gift_expiry"
+ADMIN_BROADCAST        = "admin_broadcast"
+ADMIN_MANAGE_USER_ID   = "admin_manage_user_id"
+ADMIN_MANAGE_USER_ACT  = "admin_manage_user_act"
+ADMIN_ADD_CHANNEL      = "admin_add_channel"
+ADMIN_REMOVE_CHANNEL   = "admin_remove_channel"
+ADMIN_ADD_METHOD_NAME  = "admin_add_method_name"
+ADMIN_ADD_METHOD_MIN   = "admin_add_method_min"
+ADMIN_ADD_METHOD_MAX   = "admin_add_method_max"
+ADMIN_ADD_METHOD_INST  = "admin_add_method_inst"
+ADMIN_REMOVE_METHOD    = "admin_remove_method"
+ADMIN_METHOD_LIMITS_SEL = "admin_method_limits_sel"
+ADMIN_METHOD_LIMITS_ACT = "admin_method_limits_act"
+ADMIN_SET_MIN_WD       = "admin_set_min_wd"
+ADMIN_SET_BONUS        = "admin_set_bonus"
+ADMIN_SET_SUPPORT      = "admin_set_support"
+
+
 # ==================== DATABASE ====================
 def db_connect():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
-async def run_db_query(query: str, params: tuple = (), fetch: str = "none"):
-    def _query():
-        with db_connect() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            if fetch == "one":
-                return cursor.fetchone()
-            elif fetch == "all":
-                return cursor.fetchall()
-            else:
-                conn.commit()
-                return None
-    return await asyncio.to_thread(_query)
+_db_lock = asyncio.Lock()
+
+async def run_db(query: str, params: tuple = (), fetch: str = "none"):
+    """Thread-safe DB helper."""
+    async with _db_lock:
+        def _q():
+            with db_connect() as conn:
+                cur = conn.cursor()
+                cur.execute(query, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                elif fetch == "all":
+                    return cur.fetchall()
+                else:
+                    conn.commit()
+                    return None
+        return await asyncio.to_thread(_q)
+
 
 async def init_db():
     queries = [
@@ -128,134 +193,238 @@ async def init_db():
         """CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT
-        )"""
+        )""",
     ]
     for q in queries:
-        await run_db_query(q)
+        await run_db(q)
 
     defaults = [
-        ("min_withdraw", "10"),
-        ("referral_bonus", "5"),
-        ("withdraw_enabled", "true"),
-        ("support_username", ""),
+        ("min_withdraw",    "10"),
+        ("referral_bonus",  "5"),
+        ("withdraw_enabled","true"),
+        ("support_username",""),
     ]
     for key, val in defaults:
-        await run_db_query("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val))
-
-    default_methods = [
-        ("bKash",  50,  5000, "Send your bKash number"),
-        ("Nagad",  50,  5000, "Send your Nagad number"),
-        ("Rocket", 50,  5000, "Send your Rocket number"),
-        ("Bank",  100,     0, "Send your bank account details"),
-    ]
-    for name, mn, mx, inst in default_methods:
-        await run_db_query(
-            "INSERT OR IGNORE INTO withdraw_methods (method_name, min_amount, max_amount, instructions) VALUES (?,?,?,?)",
-            (name, mn, mx, inst)
+        await run_db(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, val)
         )
 
-# ==================== HELPERS ====================
+    default_methods = [
+        ("bKash",  50, 5000, "Send your bKash number"),
+        ("Nagad",  50, 5000, "Send your Nagad number"),
+        ("Rocket", 50, 5000, "Send your Rocket number"),
+        ("Bank",  100,    0, "Send your bank account details"),
+    ]
+    for name, mn, mx, inst in default_methods:
+        await run_db(
+            "INSERT OR IGNORE INTO withdraw_methods "
+            "(method_name, min_amount, max_amount, instructions) VALUES (?,?,?,?)",
+            (name, mn, mx, inst),
+        )
+
+
+# ==================== SETTINGS HELPERS ====================
+async def get_setting(key: str, default: str = "") -> str:
+    row = await run_db("SELECT value FROM settings WHERE key=?", (key,), "one")
+    return row["value"] if row else default
+
+
+async def set_setting(key: str, value: str):
+    await run_db(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value)
+    )
+
+
+# ==================== USER HELPERS ====================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
-async def get_setting(key: str, default: str = "") -> str:
-    row = await run_db_query("SELECT value FROM settings WHERE key=?", (key,), "one")
-    return row["value"] if row else default
-
-async def set_setting(key: str, value: str):
-    await run_db_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)", (key, value))
 
 async def get_user_balance(user_id: int) -> float:
-    row = await run_db_query("SELECT balance FROM users WHERE user_id=?", (user_id,), "one")
+    row = await run_db("SELECT balance FROM users WHERE user_id=?", (user_id,), "one")
     return float(row["balance"]) if row else 0.0
 
-async def update_balance(user_id: int, amount: float):
-    await run_db_query("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
-    if amount > 0:
-        await run_db_query("UPDATE users SET total_earned = total_earned + ? WHERE user_id=?", (amount, user_id))
 
-async def register_user(user_id: int, username: str = None, full_name: str = None, ref: int = None):
-    existing = await run_db_query("SELECT user_id FROM users WHERE user_id=?", (user_id,), "one")
+async def update_balance(user_id: int, amount: float):
+    await run_db(
+        "UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id)
+    )
+    if amount > 0:
+        await run_db(
+            "UPDATE users SET total_earned = total_earned + ? WHERE user_id=?",
+            (amount, user_id),
+        )
+
+
+async def register_user(
+    user_id: int,
+    username: str = None,
+    full_name: str = None,
+    ref: int = None,
+):
+    existing = await run_db(
+        "SELECT user_id FROM users WHERE user_id=?", (user_id,), "one"
+    )
     if existing:
-        await run_db_query(
+        await run_db(
             "UPDATE users SET username=?, full_name=? WHERE user_id=?",
-            (username, full_name, user_id)
+            (username, full_name, user_id),
         )
         return
 
     if ref == user_id:
         ref = None
 
-    await run_db_query(
+    await run_db(
         "INSERT INTO users (user_id, username, full_name, referred_by) VALUES (?,?,?,?)",
-        (user_id, username, full_name, ref)
+        (user_id, username, full_name, ref),
     )
 
     if ref:
-        ref_exists = await run_db_query("SELECT user_id FROM users WHERE user_id=?", (ref,), "one")
+        ref_exists = await run_db(
+            "SELECT user_id FROM users WHERE user_id=?", (ref,), "one"
+        )
         if ref_exists:
             bonus = float(await get_setting("referral_bonus", "5"))
             await update_balance(ref, bonus)
-            await run_db_query(
+            await run_db(
                 "INSERT OR IGNORE INTO referrals (referrer_id, referred_id, bonus_paid) VALUES (?,?,1)",
-                (ref, user_id)
+                (ref, user_id),
             )
+            try:
+                pass  # Notification sent later by caller
+            except Exception:
+                pass
+
 
 # ==================== FORCE JOIN ====================
-async def check_force_join(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
+async def check_force_join(
+    user_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> tuple[bool, list]:
+    """Returns (all_joined, missing_channels)."""
+    channels = await run_db(
+        "SELECT channel_username FROM channels", fetch="all"
+    )
     if not channels:
-        return True
-    for row in channels:
-        try:
-            member = await context.bot.get_chat_member(f"@{row['channel_username']}", user_id)
-            if member.status in ["left", "kicked"]:
-                return False
-        except Exception:
-            return False
-    return True
+        return True, []
 
-async def show_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
-    msg = "⛔ *You must join these channels first:*\n\n"
-    for ch in channels:
-        msg += f"📢 @{ch['channel_username']}\n"
-    msg += "\n✅ After joining, send /start again."
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    missing = []
+    for row in channels:
+        ch = row["channel_username"]
+        try:
+            # Try with @ prefix first
+            chat_id = f"@{ch}" if not ch.startswith("@") else ch
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ("left", "kicked", "restricted"):
+                missing.append(ch)
+        except Exception as e:
+            logger.warning(f"Force join check error for @{ch}: {e}")
+            missing.append(ch)
+
+    return len(missing) == 0, missing
+
+
+async def show_force_join_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, missing: list
+):
+    msg = "⛔ *আপনাকে নিচের চ্যানেলগুলোতে Join করতে হবে:*\n\n"
+    buttons = []
+    for ch in missing:
+        username = ch.lstrip("@")
+        msg += f"📢 @{username}\n"
+        buttons.append(
+            [InlineKeyboardButton(f"➡️ Join @{username}", url=f"https://t.me/{username}")]
+        )
+    buttons.append(
+        [InlineKeyboardButton("✅ Join করেছি - Check করুন", callback_data="check_join")]
+    )
+    msg += "\n✅ সব চ্যানেলে Join করার পর *\"Join করেছি\"* বাটনে ক্লিক করুন।"
+    await update.message.reply_text(
+        msg,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def check_join_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Handles 'I joined' button click."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    joined, missing = await check_force_join(user.id, context)
+    if joined:
+        # Register and show main menu
+        await register_user(user.id, user.username, user.full_name)
+        balance = await get_user_balance(user.id)
+        await query.message.delete()
+        await context.bot.send_message(
+            user.id,
+            f"✅ *ধন্যবাদ! আপনি সব চ্যানেলে Join করেছেন!*\n\n"
+            f"👋 Welcome, *{user.first_name}*!\n"
+            f"💰 আপনার balance: `{balance:.2f}` coins\n\n"
+            f"টাস্ক করুন, বন্ধুদের Invite করুন এবং coins আয় করুন! 🚀",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(is_admin(user.id)),
+        )
+    else:
+        msg = "❌ *আপনি এখনও এই চ্যানেলগুলোতে Join করেননি:*\n\n"
+        buttons = []
+        for ch in missing:
+            username = ch.lstrip("@")
+            msg += f"📢 @{username}\n"
+            buttons.append(
+                [InlineKeyboardButton(f"➡️ Join @{username}", url=f"https://t.me/{username}")]
+            )
+        buttons.append(
+            [InlineKeyboardButton("✅ Join করেছি - Check করুন", callback_data="check_join")]
+        )
+        msg += "\n✅ সব চ্যানেলে Join করুন এবং আবার Check করুন।"
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+
 
 # ==================== KEYBOARDS ====================
 def get_main_keyboard(admin: bool = False) -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton("👤 Account"),    KeyboardButton("💰 Wallet")],
-        [KeyboardButton("👥 Team"),       KeyboardButton("🎁 Invite")],
-        [KeyboardButton("📋 Tasks"),      KeyboardButton("🏆 Leaderboard")],
-        [KeyboardButton("💳 Withdraw"),   KeyboardButton("🎁 Redeem")],
-        [KeyboardButton("📢 Channels"),   KeyboardButton("🆘 Support")],
+        [KeyboardButton("👤 Account"),  KeyboardButton("💰 Wallet")],
+        [KeyboardButton("👥 Team"),     KeyboardButton("🎁 Invite")],
+        [KeyboardButton("📋 Tasks"),    KeyboardButton("🏆 Leaderboard")],
+        [KeyboardButton("💳 Withdraw"), KeyboardButton("🎁 Redeem")],
+        [KeyboardButton("📢 Channels"), KeyboardButton("🆘 Support")],
     ]
     if admin:
         buttons.append([KeyboardButton("🔧 Admin Panel")])
     buttons.append([KeyboardButton("🏠 Home")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
 def get_admin_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton("➕ Add Task"),         KeyboardButton("❌ Remove Task")],
-        [KeyboardButton("📥 Pending Tasks"),     KeyboardButton("💸 Withdraw Requests")],
-        [KeyboardButton("🎁 Create Gift Code"),  KeyboardButton("📢 Broadcast")],
-        [KeyboardButton("📊 Analytics"),         KeyboardButton("👤 Manage User")],
-        [KeyboardButton("➕ Add Channel"),        KeyboardButton("❌ Remove Channel")],
-        [KeyboardButton("💳 Add Method"),         KeyboardButton("🗑 Remove Method")],
-        [KeyboardButton("⚙️ Method Limits"),      KeyboardButton("🔘 Toggle Withdraw")],
-        [KeyboardButton("💰 Min Withdraw"),       KeyboardButton("👥 Referral Bonus")],
-        [KeyboardButton("📞 Set Support"),        KeyboardButton("🏠 Home")],
+        [KeyboardButton("➕ Add Task"),        KeyboardButton("❌ Remove Task")],
+        [KeyboardButton("📥 Pending Tasks"),    KeyboardButton("💸 Withdraw Requests")],
+        [KeyboardButton("🎁 Create Gift Code"), KeyboardButton("📢 Broadcast")],
+        [KeyboardButton("📊 Analytics"),        KeyboardButton("👤 Manage User")],
+        [KeyboardButton("➕ Add Channel"),       KeyboardButton("❌ Remove Channel")],
+        [KeyboardButton("💳 Add Method"),        KeyboardButton("🗑 Remove Method")],
+        [KeyboardButton("⚙️ Method Limits"),     KeyboardButton("🔘 Toggle Withdraw")],
+        [KeyboardButton("💰 Min Withdraw"),      KeyboardButton("👥 Referral Bonus")],
+        [KeyboardButton("📞 Set Support"),       KeyboardButton("🏠 Home")],
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 
 def get_back_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton("🔙 Back"), KeyboardButton("🏠 Home")]],
-        resize_keyboard=True
+        resize_keyboard=True,
     )
+
 
 def get_method_keyboard(methods) -> ReplyKeyboardMarkup:
     buttons = []
@@ -270,26 +439,46 @@ def get_method_keyboard(methods) -> ReplyKeyboardMarkup:
     buttons.append([KeyboardButton("🔙 Back"), KeyboardButton("🏠 Home")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ==================== USER MENUS ====================
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# ==================== STATE HELPER ====================
+def set_state(context: ContextTypes.DEFAULT_TYPE, state: str, **kwargs):
     context.user_data.clear()
+    context.user_data["_state"] = state
+    for k, v in kwargs.items():
+        context.user_data[k] = v
+
+
+def get_state(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return context.user_data.get("_state")
+
+
+def clear_state(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+
+
+# ==================== MENUS ====================
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    clear_state(context)
     await update.message.reply_text(
-        "🏠 *Main Menu* — Choose an option:",
+        "🏠 *Main Menu* — একটি অপশন বেছে নিন:",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard(is_admin(update.effective_user.id))
+        reply_markup=get_main_keyboard(is_admin(update.effective_user.id)),
     )
+
 
 async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = await run_db_query("SELECT * FROM users WHERE user_id=?", (uid,), "one")
+    user = await run_db("SELECT * FROM users WHERE user_id=?", (uid,), "one")
     if not user:
-        await update.message.reply_text("Account not found. Send /start.")
+        await update.message.reply_text("Account পাওয়া যায়নি। /start পাঠান।")
         return
-    refs = await run_db_query("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,), "one")
+    refs = await run_db(
+        "SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,), "one"
+    )
     text = (
-        f"👤 *Your Account*\n\n"
+        f"👤 *আপনার Account*\n\n"
         f"🆔 ID: `{user['user_id']}`\n"
-        f"👤 Name: {user['full_name'] or 'N/A'}\n"
+        f"👤 নাম: {user['full_name'] or 'N/A'}\n"
         f"📛 Username: @{user['username'] or 'N/A'}\n"
         f"💰 Balance: `{user['balance']:.2f}` coins\n"
         f"📈 Total Earned: `{user['total_earned']:.2f}` coins\n"
@@ -298,11 +487,12 @@ async def show_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
+
 async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     balance = await get_user_balance(uid)
     min_w = await get_setting("min_withdraw", "10")
-    methods = await run_db_query("SELECT * FROM withdraw_methods WHERE enabled=1", fetch="all")
+    methods = await run_db("SELECT * FROM withdraw_methods WHERE enabled=1", fetch="all")
     m_text = ""
     for m in methods:
         mx = f" | Max: {m['max_amount']:.0f}" if float(m["max_amount"]) > 0 else ""
@@ -311,30 +501,35 @@ async def show_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 *Wallet*\n\n"
         f"💵 Balance: `{balance:.2f}` coins\n"
         f"📉 Global Min Withdraw: `{min_w}` coins\n\n"
-        f"💳 *Withdraw Methods:*\n{m_text if m_text else 'No methods available.'}"
+        f"💳 *Withdraw Methods:*\n{m_text if m_text else 'কোনো method নেই।'}"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
+
 async def show_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    refs = await run_db_query("SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,), "one")
+    refs = await run_db(
+        "SELECT COUNT(*) as c FROM referrals WHERE referrer_id=?", (uid,), "one"
+    )
     bonus = await get_setting("referral_bonus", "5")
-    ref_list = await run_db_query(
+    ref_list = await run_db(
         "SELECT u.full_name, u.username FROM referrals r "
         "JOIN users u ON r.referred_id=u.user_id WHERE r.referrer_id=? LIMIT 10",
-        (uid,), "all"
+        (uid,),
+        "all",
     )
     text = (
-        f"👥 *Your Team*\n\n"
+        f"👥 *আপনার Team*\n\n"
         f"Total Referrals: `{refs['c'] if refs else 0}`\n"
         f"Bonus per Referral: `{bonus}` coins\n\n"
     )
     if ref_list:
         text += "📋 *Recent Referrals:*\n"
         for r in ref_list:
-            name = f"@{r['username']}" if r['username'] else (r['full_name'] or "Unknown")
+            name = f"@{r['username']}" if r["username"] else (r["full_name"] or "Unknown")
             text += f"  • {name}\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
 
 async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -342,60 +537,70 @@ async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = f"https://t.me/{bot_info.username}?start=ref_{uid}"
     bonus = await get_setting("referral_bonus", "5")
     text = (
-        f"🎁 *Your Invite Link*\n\n"
+        f"🎁 *আপনার Invite Link*\n\n"
         f"`{link}`\n\n"
-        f"✅ Earn `{bonus}` coins for every friend who joins!\n"
-        f"Share and start earning 🎉"
+        f"✅ প্রতিটি বন্ধুর জন্য `{bonus}` coins আয় করুন!\n"
+        f"Share করুন এবং আয় শুরু করুন 🎉"
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
+
 async def show_channels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
+    channels = await run_db("SELECT channel_username FROM channels", fetch="all")
     if not channels:
-        text = "📢 No required channels configured."
+        text = "📢 কোনো required channel নেই।"
     else:
         text = "📢 *Required Channels:*\n\n"
         for ch in channels:
             text += f"• @{ch['channel_username']}\n"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
+
 async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     support_username = await get_setting("support_username", "")
     if support_username:
         text = (
             f"🆘 *Support*\n\n"
-            f"For any issues, contact us:\n"
+            f"যেকোনো সমস্যায় যোগাযোগ করুন:\n"
             f"👤 @{support_username}\n\n"
-            f"We'll get back to you as soon as possible."
+            f"আমরা যত তাড়াতাড়ি সম্ভব সাহায্য করব।"
         )
     else:
-        text = "🆘 *Support*\n\nFor any issues, please contact the admin."
+        text = "🆘 *Support*\n\nযেকোনো সমস্যায় Admin-এর সাথে যোগাযোগ করুন।"
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
 
 # ==================== TASKS ====================
 async def show_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = await run_db_query("SELECT * FROM tasks WHERE enabled=1", fetch="all")
+    tasks = await run_db("SELECT * FROM tasks WHERE enabled=1", fetch="all")
     if not tasks:
-        await update.message.reply_text("📋 No tasks available right now.", reply_markup=get_back_keyboard())
+        await update.message.reply_text("📋 এখন কোনো task নেই।", reply_markup=get_back_keyboard())
         return
     msg = "📋 *Available Tasks:*\n\n"
     for t in tasks:
         msg += f"🔸 ID `{t['id']}` — *{t['title']}*\n"
         msg += f"   💰 Reward: `{t['reward']:.2f}` coins\n\n"
-    msg += "📌 Send a Task ID to view details."
+    msg += "📌 Task ID পাঠান বিস্তারিত দেখতে।"
+    set_state(context, TASK_LIST)
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
-    context.user_data["awaiting_task_id"] = True
+
 
 async def show_task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, task_id: int):
-    task = await run_db_query("SELECT * FROM tasks WHERE id=? AND enabled=1", (task_id,), "one")
+    uid = update.effective_user.id
+    task = await run_db("SELECT * FROM tasks WHERE id=? AND enabled=1", (task_id,), "one")
     if not task:
-        await update.message.reply_text("❌ Task not found.")
+        await update.message.reply_text("❌ Task পাওয়া যায়নি।")
         return
-    already = await run_db_query(
+    already = await run_db(
         "SELECT id FROM submissions WHERE user_id=? AND task_id=? AND status IN ('pending','approved')",
-        (update.effective_user.id, task_id), "one"
+        (uid, task_id),
+        "one",
     )
-    footer = "\n⚠️ You already submitted this task." if already else f"\n👉 To start, send: /do_{task_id}"
+    footer = (
+        "\n\n⚠️ আপনি এই task আগেই submit করেছেন।"
+        if already
+        else f"\n\n👉 Task শুরু করতে পাঠান: `/do_{task_id}`"
+    )
     text = (
         f"📌 *{task['title']}*\n\n"
         f"📝 Description: {task['description'] or 'N/A'}\n"
@@ -405,423 +610,600 @@ async def show_task_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
-# ==================== WITHDRAW ====================
-async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await get_setting("withdraw_enabled", "true") != "true":
-        await update.message.reply_text("❌ Withdrawals are currently disabled.")
+
+# ==================== TASK COMMAND /do_X ====================
+async def handle_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    text = update.message.text
+    try:
+        task_id = int(text.split("_")[1])
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Invalid task command.")
         return
 
-    balance = await get_user_balance(update.effective_user.id)
-    min_w = float(await get_setting("min_withdraw", "10"))
+    uid = update.effective_user.id
 
+    joined, missing = await check_force_join(uid, context)
+    if not joined:
+        await show_force_join_message(update, context, missing)
+        return
+
+    existing = await run_db(
+        "SELECT id FROM submissions WHERE user_id=? AND task_id=? AND status IN ('pending','approved')",
+        (uid, task_id),
+        "one",
+    )
+    if existing:
+        await update.message.reply_text("⚠️ আপনি এই task আগেই submit করেছেন!")
+        return
+
+    task = await run_db("SELECT title FROM tasks WHERE id=? AND enabled=1", (task_id,), "one")
+    if not task:
+        await update.message.reply_text("❌ Task পাওয়া যায়নি।")
+        return
+
+    set_state(context, TASK_PHOTO, task_id=task_id)
+    await update.message.reply_text(
+        f"📸 Task: *{task['title']}*\n\nকাজ সম্পন্ন করার প্রমাণ হিসেবে একটি Screenshot পাঠান:",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
+    )
+
+
+# ==================== PHOTO HANDLER ====================
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    state = get_state(context)
+
+    if state != TASK_PHOTO:
+        await update.message.reply_text("📋 প্রথমে একটি task বেছে নিন। /do_ID দিয়ে শুরু করুন।")
+        return
+
+    task_id = context.user_data.get("task_id")
+    if not task_id:
+        await update.message.reply_text("❌ Task ID পাওয়া যায়নি। আবার চেষ্টা করুন।")
+        clear_state(context)
+        return
+
+    # Double-check not already submitted
+    existing = await run_db(
+        "SELECT id FROM submissions WHERE user_id=? AND task_id=? AND status IN ('pending','approved')",
+        (uid, task_id),
+        "one",
+    )
+    if existing:
+        await update.message.reply_text("⚠️ আপনি এই task আগেই submit করেছেন!")
+        clear_state(context)
+        return
+
+    photo = update.message.photo[-1].file_id
+    await run_db(
+        "INSERT INTO submissions (user_id, task_id, screenshot_file_id) VALUES (?,?,?)",
+        (uid, task_id, photo),
+    )
+    sub_row = await run_db(
+        "SELECT id FROM submissions WHERE user_id=? AND task_id=? ORDER BY id DESC",
+        (uid, task_id),
+        "one",
+    )
+    sub_id = sub_row["id"] if sub_row else "?"
+    task = await run_db("SELECT title, reward FROM tasks WHERE id=?", (task_id,), "one")
+
+    await update.message.reply_text(
+        "✅ *Task submit হয়েছে! Review এর জন্য অপেক্ষা করুন।*\nApprove হলে আপনাকে জানানো হবে।",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(is_admin(uid)),
+    )
+    clear_state(context)
+
+    # Notify admins
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_photo(
+                admin_id,
+                photo,
+                caption=(
+                    f"📝 *নতুন Task Submission!*\n\n"
+                    f"👤 User: `{uid}`\n"
+                    f"📋 Task: {task['title'] if task else task_id}\n"
+                    f"💰 Reward: {task['reward'] if task else '?'} coins\n"
+                    f"🆔 Sub ID: `{sub_id}`\n\n"
+                    f"Reply করুন:\n✅ `approve {sub_id}`\n❌ `reject {sub_id}`"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify admin {admin_id}: {e}")
+
+
+# ==================== WITHDRAW ====================
+async def withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if await get_setting("withdraw_enabled", "true") != "true":
+        await update.message.reply_text("❌ Withdrawal এখন বন্ধ আছে।")
+        return
+
+    balance = await get_user_balance(uid)
+    min_w = float(await get_setting("min_withdraw", "10"))
     if balance < min_w:
         await update.message.reply_text(
             f"❌ Minimum withdraw: `{min_w:.2f}` coins\n"
-            f"Your balance: `{balance:.2f}` coins",
-            parse_mode="Markdown"
+            f"আপনার balance: `{balance:.2f}` coins",
+            parse_mode="Markdown",
         )
         return
 
-    methods = await run_db_query("SELECT * FROM withdraw_methods WHERE enabled=1", fetch="all")
+    methods = await run_db("SELECT * FROM withdraw_methods WHERE enabled=1", fetch="all")
     if not methods:
-        await update.message.reply_text("❌ No withdraw methods available.")
+        await update.message.reply_text("❌ কোনো withdraw method নেই।")
         return
 
-    context.user_data.clear()
-    context.user_data["withdraw_state"] = "method"
-    context.user_data["withdraw_methods"] = {m["method_name"]: dict(m) for m in methods}
+    methods_dict = {m["method_name"]: dict(m) for m in methods}
+    set_state(context, WD_METHOD, wd_methods=methods_dict)
 
-    text = "💳 *Choose a Withdraw Method:*\n\n"
+    text = "💳 *একটি Withdraw Method বেছে নিন:*\n\n"
     for m in methods:
         mx = f" | Max: {m['max_amount']:.0f}" if float(m["max_amount"]) > 0 else ""
         text += f"• *{m['method_name']}* — Min: {m['min_amount']:.0f}{mx} coins\n"
 
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_method_keyboard(methods))
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=get_method_keyboard(methods)
+    )
 
-async def process_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = context.user_data.get("withdraw_state")
-    text = update.message.text
 
-    if state == "method":
-        method_name = text.replace("💳 ", "").strip()
-        methods = context.user_data.get("withdraw_methods", {})
-        if method_name not in methods:
-            await update.message.reply_text("❌ Please select a valid method from the keyboard.")
-            return
-        m = methods[method_name]
-        context.user_data["withdraw_method"] = method_name
-        context.user_data["withdraw_method_data"] = m
-        context.user_data["withdraw_state"] = "amount"
+async def process_withdraw_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.replace("💳 ", "").strip()
+    methods = context.user_data.get("wd_methods", {})
+    if text not in methods:
+        await update.message.reply_text("❌ Keyboard থেকে একটি valid method বেছে নিন।")
+        return
+    m = methods[text]
+    context.user_data["_state"] = WD_AMOUNT
+    context.user_data["wd_method"] = text
+    context.user_data["wd_method_data"] = m
+    balance = await get_user_balance(update.effective_user.id)
+    mx_text = f" (Max: {m['max_amount']:.0f})" if float(m["max_amount"]) > 0 else ""
+    await update.message.reply_text(
+        f"💰 Withdraw করার পরিমাণ লিখুন:\n"
+        f"Min: `{m['min_amount']:.0f}` coins{mx_text}\n"
+        f"আপনার balance: `{balance:.2f}` coins",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
+    )
+
+
+async def process_withdraw_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount = float(update.message.text)
+        m = context.user_data.get("wd_method_data", {})
         balance = await get_user_balance(update.effective_user.id)
-        mx_text = f" (Max: {m['max_amount']:.0f})" if float(m["max_amount"]) > 0 else ""
-        await update.message.reply_text(
-            f"💰 Enter amount to withdraw:\n"
-            f"Min: `{m['min_amount']:.0f}` coins{mx_text}\n"
-            f"Your balance: `{balance:.2f}` coins",
-            parse_mode="Markdown", reply_markup=get_back_keyboard()
-        )
-
-    elif state == "amount":
-        try:
-            amount = float(text)
-            m = context.user_data.get("withdraw_method_data", {})
-            balance = await get_user_balance(update.effective_user.id)
-            min_a = float(m.get("min_amount", 10))
-            max_a = float(m.get("max_amount", 0))
-            if amount < min_a:
-                await update.message.reply_text(f"❌ Minimum amount is `{min_a:.0f}` coins.", parse_mode="Markdown")
-                return
-            if max_a > 0 and amount > max_a:
-                await update.message.reply_text(f"❌ Maximum amount is `{max_a:.0f}` coins.", parse_mode="Markdown")
-                return
-            if amount > balance:
-                await update.message.reply_text(f"❌ Insufficient balance. You have `{balance:.2f}` coins.", parse_mode="Markdown")
-                return
-            context.user_data["withdraw_amount"] = amount
-            context.user_data["withdraw_state"] = "account"
-            inst = m.get("instructions", "")
-            inst_text = f"\n💡 {inst}" if inst else ""
+        min_a = float(m.get("min_amount", 10))
+        max_a = float(m.get("max_amount", 0))
+        if amount < min_a:
             await update.message.reply_text(
-                f"📝 Enter your account details:{inst_text}",
-                parse_mode="Markdown", reply_markup=get_back_keyboard()
+                f"❌ Minimum amount: `{min_a:.0f}` coins।", parse_mode="Markdown"
             )
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Enter a number.")
-
-    elif state == "account":
-        uid = update.effective_user.id
-        amount = context.user_data["withdraw_amount"]
-        method = context.user_data["withdraw_method"]
-        await update_balance(uid, -amount)
-        await run_db_query(
-            "INSERT INTO withdrawals (user_id, amount, payment_method, account_info) VALUES (?,?,?,?)",
-            (uid, amount, method, text)
-        )
+            return
+        if max_a > 0 and amount > max_a:
+            await update.message.reply_text(
+                f"❌ Maximum amount: `{max_a:.0f}` coins।", parse_mode="Markdown"
+            )
+            return
+        if amount > balance:
+            await update.message.reply_text(
+                f"❌ যথেষ্ট balance নেই। আপনার balance: `{balance:.2f}` coins।",
+                parse_mode="Markdown",
+            )
+            return
+        context.user_data["_state"] = WD_ACCOUNT
+        context.user_data["wd_amount"] = amount
+        inst = m.get("instructions", "")
+        inst_text = f"\n💡 {inst}" if inst else ""
         await update.message.reply_text(
-            f"✅ *Withdrawal Request Submitted!*\n\n"
-            f"💰 Amount: `{amount:.2f}` coins\n"
-            f"💳 Method: {method}\n"
-            f"📝 Account: {text}\n\n"
-            f"An admin will process it shortly.",
+            f"📝 আপনার account details লিখুন:{inst_text}",
             parse_mode="Markdown",
-            reply_markup=get_main_keyboard(is_admin(uid))
+            reply_markup=get_back_keyboard(),
         )
-        context.user_data.clear()
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await context.bot.send_message(
-                    admin_id,
-                    f"💸 *New Withdrawal Request!*\n\n"
-                    f"👤 User: `{uid}`\n"
-                    f"💰 Amount: {amount:.2f} coins\n"
-                    f"💳 Method: {method}\n"
-                    f"📝 Account: {text}",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount। একটি সংখ্যা লিখুন।")
+
+
+async def process_withdraw_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    amount = context.user_data["wd_amount"]
+    method = context.user_data["wd_method"]
+    account_info = update.message.text
+
+    await update_balance(uid, -amount)
+    await run_db(
+        "INSERT INTO withdrawals (user_id, amount, payment_method, account_info) VALUES (?,?,?,?)",
+        (uid, amount, method, account_info),
+    )
+    await update.message.reply_text(
+        f"✅ *Withdrawal Request Submit হয়েছে!*\n\n"
+        f"💰 Amount: `{amount:.2f}` coins\n"
+        f"💳 Method: {method}\n"
+        f"📝 Account: {account_info}\n\n"
+        f"Admin শীঘ্রই process করবেন।",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(is_admin(uid)),
+    )
+    clear_state(context)
+
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"💸 *নতুন Withdrawal Request!*\n\n"
+                f"👤 User: `{uid}`\n"
+                f"💰 Amount: {amount:.2f} coins\n"
+                f"💳 Method: {method}\n"
+                f"📝 Account: {account_info}\n\n"
+                f"Reply করুন:\n✅ `approve_w ID`\n❌ `reject_w ID`",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
 
 # ==================== REDEEM ====================
 async def redeem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["redeem_state"] = True
-    await update.message.reply_text("🎁 Enter your gift code:", reply_markup=get_back_keyboard())
+    set_state(context, REDEEM)
+    await update.message.reply_text("🎁 আপনার Gift Code লিখুন:", reply_markup=get_back_keyboard())
+
 
 async def process_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = update.message.text.strip().upper()
     uid = update.effective_user.id
-    gift = await run_db_query("SELECT * FROM giftcodes WHERE code=?", (code,), "one")
+    gift = await run_db("SELECT * FROM giftcodes WHERE code=?", (code,), "one")
     if not gift:
-        await update.message.reply_text("❌ Invalid gift code.")
+        await update.message.reply_text("❌ Invalid gift code।")
     elif gift["expiry_date"] and datetime.now() > datetime.fromisoformat(gift["expiry_date"]):
-        await update.message.reply_text("❌ This code has expired.")
+        await update.message.reply_text("❌ এই code expired হয়ে গেছে।")
     elif int(gift["usage_limit"]) > 0 and int(gift["used_count"]) >= int(gift["usage_limit"]):
-        await update.message.reply_text("❌ This code has reached its usage limit.")
+        await update.message.reply_text("❌ এই code এর usage limit শেষ হয়ে গেছে।")
     else:
-        used = await run_db_query("SELECT 1 FROM giftcode_uses WHERE code=? AND user_id=?", (code, uid), "one")
+        used = await run_db(
+            "SELECT 1 FROM giftcode_uses WHERE code=? AND user_id=?", (code, uid), "one"
+        )
         if used:
-            await update.message.reply_text("❌ You have already used this code.")
+            await update.message.reply_text("❌ আপনি এই code আগেই ব্যবহার করেছেন।")
         else:
             await update_balance(uid, float(gift["reward"]))
-            await run_db_query("UPDATE giftcodes SET used_count=used_count+1 WHERE code=?", (code,))
-            await run_db_query("INSERT INTO giftcode_uses (code, user_id) VALUES (?,?)", (code, uid))
-            await update.message.reply_text(
-                f"✅ *Code Redeemed!*\n💰 +`{float(gift['reward']):.2f}` coins added to your balance.",
-                parse_mode="Markdown"
+            await run_db("UPDATE giftcodes SET used_count=used_count+1 WHERE code=?", (code,))
+            await run_db(
+                "INSERT INTO giftcode_uses (code, user_id) VALUES (?,?)", (code, uid)
             )
-    context.user_data.clear()
+            await update.message.reply_text(
+                f"✅ *Code Redeem হয়েছে!*\n💰 +`{float(gift['reward']):.2f}` coins আপনার account-এ যোগ হয়েছে।",
+                parse_mode="Markdown",
+            )
+    clear_state(context)
+
 
 # ==================== LEADERBOARD ====================
 async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = await run_db_query(
+    users = await run_db(
         "SELECT user_id, full_name, username, total_earned FROM users ORDER BY total_earned DESC LIMIT 10",
-        fetch="all"
+        fetch="all",
     )
     text = "🏆 *Top 10 Leaderboard*\n\n"
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for i, u in enumerate(users, 1):
         medal = medals.get(i, f"{i}.")
-        name = f"@{u['username']}" if u['username'] else (u['full_name'] or str(u["user_id"]))
+        name = (
+            f"@{u['username']}"
+            if u["username"]
+            else (u["full_name"] or str(u["user_id"]))
+        )
         text += f"{medal} {name} — `{u['total_earned']:.2f}` coins\n"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_keyboard())
+    await update.message.reply_text(
+        text, parse_mode="Markdown", reply_markup=get_back_keyboard()
+    )
+
 
 # ==================== ADMIN PANEL ====================
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    context.user_data.clear()
+    clear_state(context)
     await update.message.reply_text(
-        "🔧 *Admin Panel* — Choose an action:",
+        "🔧 *Admin Panel* — একটি action বেছে নিন:",
         parse_mode="Markdown",
-        reply_markup=get_admin_keyboard()
+        reply_markup=get_admin_keyboard(),
     )
+
 
 # --- Add Task ---
 async def add_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["add_task"] = {}
-    context.user_data["add_task_step"] = "title"
-    await update.message.reply_text("📝 Enter task title:", reply_markup=get_back_keyboard())
+    set_state(context, ADMIN_ADD_TASK_TITLE, task_data={})
+    await update.message.reply_text("📝 Task এর title লিখুন:", reply_markup=get_back_keyboard())
 
-async def add_task_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("add_task_step")
-    data = context.user_data["add_task"]
+
+async def add_task_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["task_data"]["title"] = update.message.text
+    context.user_data["_state"] = ADMIN_ADD_TASK_DESC
+    await update.message.reply_text("📄 Task এর description লিখুন:")
+
+
+async def add_task_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["task_data"]["desc"] = update.message.text
+    context.user_data["_state"] = ADMIN_ADD_TASK_LINK
+    await update.message.reply_text("🔗 Task এর link লিখুন (অথবা 'skip' পাঠান):")
+
+
+async def add_task_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if step == "title":
-        data["title"] = text
-        context.user_data["add_task_step"] = "desc"
-        await update.message.reply_text("📄 Enter description:")
-    elif step == "desc":
-        data["desc"] = text
-        context.user_data["add_task_step"] = "link"
-        await update.message.reply_text("🔗 Enter task link (or send 'skip'):")
-    elif step == "link":
-        data["link"] = None if text.lower() == "skip" else text
-        context.user_data["add_task_step"] = "reward"
-        await update.message.reply_text("💰 Enter reward amount (coins):")
-    elif step == "reward":
-        try:
-            data["reward"] = float(text)
-            await run_db_query(
-                "INSERT INTO tasks (title, description, task_link, reward) VALUES (?,?,?,?)",
-                (data["title"], data["desc"], data["link"], data["reward"])
-            )
-            await update.message.reply_text("✅ Task added successfully!", reply_markup=get_admin_keyboard())
-            context.user_data.clear()
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount. Enter a number.")
+    context.user_data["task_data"]["link"] = None if text.lower() == "skip" else text
+    context.user_data["_state"] = ADMIN_ADD_TASK_REWARD
+    await update.message.reply_text("💰 Reward amount (coins) লিখুন:")
+
+
+async def add_task_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        reward = float(update.message.text)
+        data = context.user_data["task_data"]
+        await run_db(
+            "INSERT INTO tasks (title, description, task_link, reward) VALUES (?,?,?,?)",
+            (data["title"], data["desc"], data["link"], reward),
+        )
+        await update.message.reply_text(
+            f"✅ Task *{data['title']}* সফলভাবে যোগ হয়েছে!",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard(),
+        )
+        clear_state(context)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount। একটি সংখ্যা লিখুন।")
+
 
 # --- Remove Task ---
 async def remove_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tasks = await run_db_query("SELECT id, title FROM tasks", fetch="all")
+    tasks = await run_db("SELECT id, title FROM tasks", fetch="all")
     if not tasks:
-        await update.message.reply_text("No tasks to remove.")
+        await update.message.reply_text("কোনো task নেই।")
         return
-    msg = "❌ *Remove Task* — Send the Task ID:\n\n"
+    msg = "❌ *Remove Task* — Task ID পাঠান:\n\n"
     for t in tasks:
+        status = "✅" if t["id"] else "❌"
         msg += f"ID `{t['id']}`: {t['title']}\n"
+    set_state(context, ADMIN_REMOVE_TASK)
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
-    context.user_data.clear()
-    context.user_data["remove_task"] = True
+
 
 async def remove_task_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tid = int(update.message.text)
-        task = await run_db_query("SELECT title FROM tasks WHERE id=?", (tid,), "one")
+        task = await run_db("SELECT title FROM tasks WHERE id=?", (tid,), "one")
         if not task:
-            await update.message.reply_text("❌ Task not found.")
+            await update.message.reply_text("❌ Task পাওয়া যায়নি।")
         else:
-            await run_db_query("DELETE FROM tasks WHERE id=?", (tid,))
-            await update.message.reply_text(f"✅ Task removed: *{task['title']}*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+            await run_db("DELETE FROM tasks WHERE id=?", (tid,))
+            await update.message.reply_text(
+                f"✅ Task সরানো হয়েছে: *{task['title']}*",
+                parse_mode="Markdown",
+                reply_markup=get_admin_keyboard(),
+            )
+        clear_state(context)
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID.")
-    context.user_data.clear()
+        await update.message.reply_text("❌ Invalid ID।")
+
 
 # --- Pending Submissions ---
 async def pending_submissions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    subs = await run_db_query(
+    subs = await run_db(
         "SELECT s.id, s.user_id, t.title, t.reward FROM submissions s "
         "JOIN tasks t ON s.task_id=t.id WHERE s.status='pending'",
-        fetch="all"
+        fetch="all",
     )
     if not subs:
-        await update.message.reply_text("📭 No pending submissions.")
+        await update.message.reply_text("📭 কোনো pending submission নেই।")
         return
     msg = "📥 *Pending Submissions:*\n\n"
     for s in subs:
         msg += f"ID `{s['id']}` | User `{s['user_id']}` | {s['title']} | {s['reward']} coins\n"
     msg += "\n✅ Approve: `approve ID`\n❌ Reject: `reject ID`"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    context.user_data.clear()
-    context.user_data["submission_action"] = True
+    set_state(context, ADMIN_PENDING_SUBS)
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
-async def process_submission(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def process_submission_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().lower().split()
     if len(parts) != 2 or parts[0] not in ("approve", "reject"):
-        await update.message.reply_text("❌ Format: `approve ID` or `reject ID`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Format: `approve ID` অথবা `reject ID`", parse_mode="Markdown"
+        )
         return
     try:
         sid = int(parts[1])
-        sub = await run_db_query("SELECT user_id, task_id, status FROM submissions WHERE id=?", (sid,), "one")
+        sub = await run_db(
+            "SELECT user_id, task_id, status FROM submissions WHERE id=?", (sid,), "one"
+        )
         if not sub:
-            await update.message.reply_text("❌ Submission not found.")
+            await update.message.reply_text("❌ Submission পাওয়া যায়নি।")
         elif sub["status"] != "pending":
-            await update.message.reply_text(f"⚠️ Already {sub['status']}.")
+            await update.message.reply_text(f"⚠️ ইতিমধ্যে {sub['status']}।")
         elif parts[0] == "approve":
-            task = await run_db_query("SELECT reward, title FROM tasks WHERE id=?", (sub["task_id"],), "one")
+            task = await run_db(
+                "SELECT reward, title FROM tasks WHERE id=?", (sub["task_id"],), "one"
+            )
             if task:
                 await update_balance(sub["user_id"], float(task["reward"]))
-            await run_db_query("UPDATE submissions SET status='approved' WHERE id=?", (sid,))
+            await run_db("UPDATE submissions SET status='approved' WHERE id=?", (sid,))
             await update.message.reply_text("✅ Submission approved!")
             try:
                 await context.bot.send_message(
                     sub["user_id"],
-                    f"✅ *Your task submission was approved!*\n💰 +`{float(task['reward']):.2f}` coins added.",
-                    parse_mode="Markdown"
+                    f"✅ *আপনার task submission approved হয়েছে!*\n"
+                    f"💰 +`{float(task['reward']):.2f}` coins আপনার account-এ যোগ হয়েছে।",
+                    parse_mode="Markdown",
                 )
             except Exception:
                 pass
         else:
-            await run_db_query("UPDATE submissions SET status='rejected' WHERE id=?", (sid,))
-            await update.message.reply_text("❌ Submission rejected.")
+            await run_db("UPDATE submissions SET status='rejected' WHERE id=?", (sid,))
+            await update.message.reply_text("❌ Submission rejected।")
             try:
-                await context.bot.send_message(sub["user_id"], "❌ Your task submission was rejected.")
+                await context.bot.send_message(
+                    sub["user_id"],
+                    "❌ আপনার task submission reject হয়েছে।\nভালোভাবে task সম্পন্ন করে আবার submit করুন।",
+                )
             except Exception:
                 pass
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID.")
-    context.user_data.clear()
+        await update.message.reply_text("❌ Invalid ID।")
+    clear_state(context)
+
 
 # --- Withdraw Requests (Admin) ---
 async def withdraw_requests_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reqs = await run_db_query("SELECT * FROM withdrawals WHERE status='pending'", fetch="all")
+    reqs = await run_db("SELECT * FROM withdrawals WHERE status='pending'", fetch="all")
     if not reqs:
-        await update.message.reply_text("📭 No pending withdrawal requests.")
+        await update.message.reply_text("📭 কোনো pending withdrawal request নেই।")
         return
     msg = "💸 *Pending Withdrawals:*\n\n"
     for r in reqs:
-        msg += (f"ID `{r['id']}` | User `{r['user_id']}` | "
-                f"{r['amount']} coins | {r['payment_method']} | {r['account_info']}\n")
+        msg += (
+            f"ID `{r['id']}` | User `{r['user_id']}` | "
+            f"{r['amount']} coins | {r['payment_method']} | `{r['account_info']}`\n"
+        )
     msg += "\n✅ Approve: `approve_w ID`\n❌ Reject: `reject_w ID`"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-    context.user_data.clear()
-    context.user_data["withdraw_action"] = True
+    set_state(context, ADMIN_PENDING_WD)
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
+
 
 async def process_withdraw_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().lower().split()
     if len(parts) != 2 or parts[0] not in ("approve_w", "reject_w"):
-        await update.message.reply_text("❌ Format: `approve_w ID` or `reject_w ID`", parse_mode="Markdown")
+        await update.message.reply_text(
+            "❌ Format: `approve_w ID` অথবা `reject_w ID`", parse_mode="Markdown"
+        )
         return
     try:
         wid = int(parts[1])
-        req = await run_db_query("SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,), "one")
+        req = await run_db(
+            "SELECT user_id, amount, status FROM withdrawals WHERE id=?", (wid,), "one"
+        )
         if not req:
-            await update.message.reply_text("❌ Request not found.")
+            await update.message.reply_text("❌ Request পাওয়া যায়নি।")
         elif req["status"] != "pending":
-            await update.message.reply_text(f"⚠️ Already {req['status']}.")
+            await update.message.reply_text(f"⚠️ ইতিমধ্যে {req['status']}।")
         elif parts[0] == "approve_w":
-            await run_db_query("UPDATE withdrawals SET status='approved' WHERE id=?", (wid,))
+            await run_db("UPDATE withdrawals SET status='approved' WHERE id=?", (wid,))
             await update.message.reply_text("✅ Withdrawal approved!")
             try:
                 await context.bot.send_message(
                     req["user_id"],
-                    f"✅ *Your withdrawal of `{req['amount']:.2f}` coins was approved!*\nPayment will be sent shortly.",
-                    parse_mode="Markdown"
+                    f"✅ *আপনার `{req['amount']:.2f}` coins এর withdrawal approved!*\n"
+                    f"Payment শীঘ্রই পাঠানো হবে।",
+                    parse_mode="Markdown",
                 )
             except Exception:
                 pass
         else:
-            # Refund balance on rejection
             await update_balance(req["user_id"], float(req["amount"]))
-            await run_db_query("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
-            await update.message.reply_text("❌ Withdrawal rejected. Balance refunded to user.")
+            await run_db("UPDATE withdrawals SET status='rejected' WHERE id=?", (wid,))
+            await update.message.reply_text("❌ Withdrawal rejected। Balance refund করা হয়েছে।")
             try:
                 await context.bot.send_message(
                     req["user_id"],
-                    f"❌ Your withdrawal request was rejected.\n"
-                    f"💰 `{req['amount']:.2f}` coins have been refunded to your balance.",
-                    parse_mode="Markdown"
+                    f"❌ আপনার withdrawal request reject হয়েছে।\n"
+                    f"💰 `{req['amount']:.2f}` coins আপনার account-এ ফেরত দেওয়া হয়েছে।",
+                    parse_mode="Markdown",
                 )
             except Exception:
                 pass
     except ValueError:
-        await update.message.reply_text("❌ Invalid ID.")
-    context.user_data.clear()
+        await update.message.reply_text("❌ Invalid ID।")
+    clear_state(context)
+
 
 # --- Gift Codes ---
 async def gift_codes_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["gift_code"] = {}
-    context.user_data["gift_step"] = "reward"
-    await update.message.reply_text("💰 Enter reward amount for the gift code:", reply_markup=get_back_keyboard())
+    set_state(context, ADMIN_GIFT_REWARD, gift_data={})
+    await update.message.reply_text(
+        "💰 Gift code এর reward amount লিখুন:", reply_markup=get_back_keyboard()
+    )
 
-async def process_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("gift_step")
-    data = context.user_data["gift_code"]
+
+async def gift_reward(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["gift_data"]["reward"] = float(update.message.text)
+        context.user_data["_state"] = ADMIN_GIFT_LIMIT
+        await update.message.reply_text("🔢 Usage limit লিখুন (0 = unlimited):")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount।")
+
+
+async def gift_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["gift_data"]["limit"] = int(update.message.text)
+        context.user_data["_state"] = ADMIN_GIFT_EXPIRY
+        await update.message.reply_text("📅 Expiry date লিখুন (YYYY-MM-DD) অথবা 'skip':")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid number।")
+
+
+async def gift_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if step == "reward":
-        try:
-            data["reward"] = float(text)
-            context.user_data["gift_step"] = "limit"
-            await update.message.reply_text("🔢 Enter usage limit (0 = unlimited):")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount.")
-    elif step == "limit":
-        try:
-            data["limit"] = int(text)
-            context.user_data["gift_step"] = "expiry"
-            await update.message.reply_text("📅 Enter expiry date (YYYY-MM-DD) or 'skip':")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid number.")
-    elif step == "expiry":
-        data["expiry"] = None if text.lower() == "skip" else text
-        code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        await run_db_query(
-            "INSERT INTO giftcodes (code, reward, usage_limit, expiry_date) VALUES (?,?,?,?)",
-            (code, data["reward"], data["limit"], data["expiry"])
-        )
-        await update.message.reply_text(
-            f"✅ *Gift Code Created!*\n\n"
-            f"🎁 Code: `{code}`\n"
-            f"💰 Reward: {data['reward']} coins\n"
-            f"🔢 Usage Limit: {'Unlimited' if data['limit'] == 0 else data['limit']}\n"
-            f"📅 Expiry: {data['expiry'] or 'Never'}",
-            parse_mode="Markdown", reply_markup=get_admin_keyboard()
-        )
-        context.user_data.clear()
+    data = context.user_data["gift_data"]
+    data["expiry"] = None if text.lower() == "skip" else text
+    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    await run_db(
+        "INSERT INTO giftcodes (code, reward, usage_limit, expiry_date) VALUES (?,?,?,?)",
+        (code, data["reward"], data["limit"], data["expiry"]),
+    )
+    await update.message.reply_text(
+        f"✅ *Gift Code তৈরি হয়েছে!*\n\n"
+        f"🎁 Code: `{code}`\n"
+        f"💰 Reward: {data['reward']} coins\n"
+        f"🔢 Usage Limit: {'Unlimited' if data['limit'] == 0 else data['limit']}\n"
+        f"📅 Expiry: {data['expiry'] or 'কখনো শেষ হবে না'}",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard(),
+    )
+    clear_state(context)
+
 
 # --- Broadcast ---
 async def broadcast_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["broadcast"] = True
-    await update.message.reply_text("📢 Send the message to broadcast to all users:", reply_markup=get_back_keyboard())
+    set_state(context, ADMIN_BROADCAST)
+    await update.message.reply_text(
+        "📢 সব users-দের কাছে পাঠানোর message লিখুন:", reply_markup=get_back_keyboard()
+    )
+
 
 async def process_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
-    users = await run_db_query("SELECT user_id FROM users WHERE is_banned=0", fetch="all")
-    sent = 0
-    failed = 0
+    users = await run_db("SELECT user_id FROM users WHERE is_banned=0", fetch="all")
+    sent = failed = 0
     for u in users:
         try:
-            await context.bot.send_message(u["user_id"], f"📢 *Announcement*\n\n{msg}", parse_mode="Markdown")
+            await context.bot.send_message(
+                u["user_id"],
+                f"📢 *ঘোষণা*\n\n{msg}",
+                parse_mode="Markdown",
+            )
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
     await update.message.reply_text(
-        f"✅ Broadcast complete!\n📤 Sent: {sent}\n❌ Failed: {failed}",
-        reply_markup=get_admin_keyboard()
+        f"✅ Broadcast সম্পন্ন!\n📤 Sent: {sent}\n❌ Failed: {failed}",
+        reply_markup=get_admin_keyboard(),
     )
-    context.user_data.clear()
+    clear_state(context)
+
 
 # --- Analytics ---
 async def analytics_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users = (await run_db_query("SELECT COUNT(*) as c FROM users", fetch="one"))["c"]
-    total_earned = (await run_db_query("SELECT SUM(total_earned) as s FROM users", fetch="one"))["s"] or 0
-    total_tasks = (await run_db_query("SELECT COUNT(*) as c FROM tasks WHERE enabled=1", fetch="one"))["c"]
-    pending_subs = (await run_db_query("SELECT COUNT(*) as c FROM submissions WHERE status='pending'", fetch="one"))["c"]
-    pending_w = (await run_db_query("SELECT COUNT(*) as c FROM withdrawals WHERE status='pending'", fetch="one"))["c"]
-    total_refs = (await run_db_query("SELECT COUNT(*) as c FROM referrals", fetch="one"))["c"]
+    total_users = (await run_db("SELECT COUNT(*) as c FROM users", fetch="one"))["c"]
+    total_earned = (await run_db("SELECT SUM(total_earned) as s FROM users", fetch="one"))["s"] or 0
+    total_tasks = (await run_db("SELECT COUNT(*) as c FROM tasks WHERE enabled=1", fetch="one"))["c"]
+    pending_subs = (await run_db("SELECT COUNT(*) as c FROM submissions WHERE status='pending'", fetch="one"))["c"]
+    pending_w = (await run_db("SELECT COUNT(*) as c FROM withdrawals WHERE status='pending'", fetch="one"))["c"]
+    total_refs = (await run_db("SELECT COUNT(*) as c FROM referrals", fetch="one"))["c"]
     text = (
         f"📊 *Analytics*\n\n"
         f"👥 Total Users: `{total_users}`\n"
@@ -833,227 +1215,281 @@ async def analytics_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
+
 # --- Manage User ---
 async def manage_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["manage_user"] = "search"
+    set_state(context, ADMIN_MANAGE_USER_ID)
     await update.message.reply_text(
-        "👤 *Manage User*\n\nSend the user ID:",
-        parse_mode="Markdown", reply_markup=get_back_keyboard()
+        "👤 *Manage User*\n\nUser ID পাঠান:",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
     )
 
-async def manage_user_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("manage_user")
-    text = update.message.text.strip()
 
-    if step == "search":
+async def manage_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        uid = int(update.message.text)
+        user = await run_db("SELECT * FROM users WHERE user_id=?", (uid,), "one")
+        if not user:
+            await update.message.reply_text("❌ User পাওয়া যায়নি।")
+            clear_state(context)
+            return
+        context.user_data["_state"] = ADMIN_MANAGE_USER_ACT
+        context.user_data["manage_uid"] = uid
+        ban_status = "🚫 Banned" if user["is_banned"] else "✅ Active"
+        await update.message.reply_text(
+            f"👤 *User {uid}*\n"
+            f"নাম: {user['full_name'] or 'N/A'}\n"
+            f"Balance: `{user['balance']:.2f}` coins\n"
+            f"Status: {ban_status}\n\n"
+            f"*Actions:*\n"
+            f"• `add_coins AMOUNT`\n"
+            f"• `remove_coins AMOUNT`\n"
+            f"• `ban`\n"
+            f"• `unban`",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard(),
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID।")
+        clear_state(context)
+
+
+async def manage_user_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = context.user_data.get("manage_uid")
+    parts = update.message.text.lower().split()
+    if parts[0] == "add_coins" and len(parts) == 2:
         try:
-            uid = int(text)
-            user = await run_db_query("SELECT * FROM users WHERE user_id=?", (uid,), "one")
-            if not user:
-                await update.message.reply_text("❌ User not found.")
-                context.user_data.clear()
-                return
-            context.user_data["manage_uid"] = uid
-            context.user_data["manage_user"] = "action"
-            ban_status = "🚫 Banned" if user["is_banned"] else "✅ Active"
+            amt = float(parts[1])
+            await update_balance(uid, amt)
             await update.message.reply_text(
-                f"👤 *User {uid}*\n"
-                f"Name: {user['full_name'] or 'N/A'}\n"
-                f"Balance: `{user['balance']:.2f}` coins\n"
-                f"Status: {ban_status}\n\n"
-                f"*Actions:*\n"
-                f"• `add_coins AMOUNT`\n"
-                f"• `remove_coins AMOUNT`\n"
-                f"• `ban`\n"
-                f"• `unban`",
-                parse_mode="Markdown", reply_markup=get_back_keyboard()
+                f"✅ `{amt}` coins user `{uid}` এর account-এ যোগ হয়েছে।",
+                parse_mode="Markdown",
             )
         except ValueError:
-            await update.message.reply_text("❌ Invalid user ID.")
-            context.user_data.clear()
+            await update.message.reply_text("❌ Invalid amount।")
+    elif parts[0] == "remove_coins" and len(parts) == 2:
+        try:
+            amt = float(parts[1])
+            await update_balance(uid, -amt)
+            await update.message.reply_text(
+                f"✅ `{amt}` coins user `{uid}` এর account থেকে কাটা হয়েছে।",
+                parse_mode="Markdown",
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount।")
+    elif parts[0] == "ban":
+        await run_db("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
+        await update.message.reply_text(f"✅ User `{uid}` banned।", parse_mode="Markdown")
+    elif parts[0] == "unban":
+        await run_db("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
+        await update.message.reply_text(f"✅ User `{uid}` unbanned।", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Unknown action।")
+    clear_state(context)
 
-    elif step == "action":
-        uid = context.user_data.get("manage_uid")
-        parts = text.lower().split()
-        if parts[0] == "add_coins" and len(parts) == 2:
-            try:
-                amt = float(parts[1])
-                await update_balance(uid, amt)
-                await update.message.reply_text(f"✅ Added `{amt}` coins to user `{uid}`.", parse_mode="Markdown")
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount.")
-        elif parts[0] == "remove_coins" and len(parts) == 2:
-            try:
-                amt = float(parts[1])
-                await update_balance(uid, -amt)
-                await update.message.reply_text(f"✅ Removed `{amt}` coins from user `{uid}`.", parse_mode="Markdown")
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount.")
-        elif parts[0] == "ban":
-            await run_db_query("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
-            await update.message.reply_text(f"✅ User `{uid}` banned.", parse_mode="Markdown")
-        elif parts[0] == "unban":
-            await run_db_query("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
-            await update.message.reply_text(f"✅ User `{uid}` unbanned.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ Unknown action.")
-        context.user_data.clear()
 
 # --- Channels ---
 async def add_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["add_channel"] = True
-    await update.message.reply_text("Send channel username (e.g. @yourchannel):", reply_markup=get_back_keyboard())
+    set_state(context, ADMIN_ADD_CHANNEL)
+    await update.message.reply_text(
+        "Channel username পাঠান (যেমন: @yourchannel অথবা yourchannel):",
+        reply_markup=get_back_keyboard(),
+    )
 
-async def process_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def add_channel_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.replace("@", "").strip()
-    await run_db_query("INSERT OR IGNORE INTO channels (channel_username) VALUES (?)", (username,))
-    await update.message.reply_text(f"✅ Channel @{username} added!", reply_markup=get_admin_keyboard())
-    context.user_data.clear()
+    if not username:
+        await update.message.reply_text("❌ Invalid username।")
+        return
+    await run_db(
+        "INSERT OR IGNORE INTO channels (channel_username) VALUES (?)", (username,)
+    )
+    await update.message.reply_text(
+        f"✅ Channel @{username} যোগ হয়েছে!\n\n"
+        f"⚠️ নিশ্চিত করুন Bot টি @{username} এর admin।",
+        reply_markup=get_admin_keyboard(),
+    )
+    clear_state(context)
+
 
 async def remove_channel_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
+    channels = await run_db("SELECT channel_username FROM channels", fetch="all")
     if not channels:
-        await update.message.reply_text("No channels to remove.")
+        await update.message.reply_text("কোনো channel নেই।")
         return
-    context.user_data.clear()
-    context.user_data["remove_channel"] = True
-    msg = "Send channel username to remove:\n\n"
+    set_state(context, ADMIN_REMOVE_CHANNEL)
+    msg = "সরাতে চাওয়া channel username পাঠান:\n\n"
     for ch in channels:
         msg += f"• @{ch['channel_username']}\n"
     await update.message.reply_text(msg, reply_markup=get_back_keyboard())
 
-async def process_remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def remove_channel_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.replace("@", "").strip()
-    await run_db_query("DELETE FROM channels WHERE channel_username=?", (username,))
-    await update.message.reply_text(f"✅ Channel @{username} removed!", reply_markup=get_admin_keyboard())
-    context.user_data.clear()
+    await run_db("DELETE FROM channels WHERE channel_username=?", (username,))
+    await update.message.reply_text(
+        f"✅ Channel @{username} সরানো হয়েছে!", reply_markup=get_admin_keyboard()
+    )
+    clear_state(context)
+
 
 # --- Withdraw Methods ---
 async def add_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["add_method"] = {}
-    context.user_data["add_method_step"] = "name"
-    await update.message.reply_text("💳 Enter method name (e.g. bKash, PayPal, USDT):", reply_markup=get_back_keyboard())
+    set_state(context, ADMIN_ADD_METHOD_NAME, method_data={})
+    await update.message.reply_text(
+        "💳 Method এর নাম লিখুন (যেমন: bKash, PayPal, USDT):",
+        reply_markup=get_back_keyboard(),
+    )
 
-async def add_method_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("add_method_step")
-    data = context.user_data["add_method"]
+
+async def add_method_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["method_data"]["name"] = update.message.text.strip()
+    context.user_data["_state"] = ADMIN_ADD_METHOD_MIN
+    await update.message.reply_text(
+        f"*{update.message.text}* এর minimum withdrawal amount লিখুন:",
+        parse_mode="Markdown",
+    )
+
+
+async def add_method_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["method_data"]["min"] = float(update.message.text)
+        context.user_data["_state"] = ADMIN_ADD_METHOD_MAX
+        await update.message.reply_text("Maximum withdrawal amount লিখুন (0 = no limit):")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount।")
+
+
+async def add_method_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        context.user_data["method_data"]["max"] = float(update.message.text)
+        context.user_data["_state"] = ADMIN_ADD_METHOD_INST
+        await update.message.reply_text("Users-দের জন্য instructions লিখুন (অথবা 'skip'):")
+    except ValueError:
+        await update.message.reply_text("❌ Invalid amount।")
+
+
+async def add_method_inst(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    if step == "name":
-        data["name"] = text
-        context.user_data["add_method_step"] = "min"
-        await update.message.reply_text(f"Enter minimum withdrawal amount for *{text}*:", parse_mode="Markdown")
-    elif step == "min":
-        try:
-            data["min"] = float(text)
-            context.user_data["add_method_step"] = "max"
-            await update.message.reply_text("Enter maximum withdrawal amount (0 = no limit):")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount.")
-    elif step == "max":
-        try:
-            data["max"] = float(text)
-            context.user_data["add_method_step"] = "instructions"
-            await update.message.reply_text("Enter instructions for users (or 'skip'):")
-        except ValueError:
-            await update.message.reply_text("❌ Invalid amount.")
-    elif step == "instructions":
-        data["inst"] = None if text.lower() == "skip" else text
-        await run_db_query(
-            "INSERT OR REPLACE INTO withdraw_methods (method_name, min_amount, max_amount, instructions) VALUES (?,?,?,?)",
-            (data["name"], data["min"], data["max"], data["inst"])
-        )
-        await update.message.reply_text(
-            f"✅ Method *{data['name']}* added!\n"
-            f"Min: {data['min']} | Max: {data['max'] if data['max'] > 0 else 'No limit'}",
-            parse_mode="Markdown", reply_markup=get_admin_keyboard()
-        )
-        context.user_data.clear()
+    data = context.user_data["method_data"]
+    data["inst"] = None if text.lower() == "skip" else text
+    await run_db(
+        "INSERT OR REPLACE INTO withdraw_methods "
+        "(method_name, min_amount, max_amount, instructions) VALUES (?,?,?,?)",
+        (data["name"], data["min"], data["max"], data["inst"]),
+    )
+    await update.message.reply_text(
+        f"✅ Method *{data['name']}* যোগ হয়েছে!\n"
+        f"Min: {data['min']} | Max: {data['max'] if data['max'] > 0 else 'No limit'}",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard(),
+    )
+    clear_state(context)
+
 
 async def remove_method_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    methods = await run_db_query("SELECT method_name FROM withdraw_methods", fetch="all")
+    methods = await run_db("SELECT method_name FROM withdraw_methods", fetch="all")
     if not methods:
-        await update.message.reply_text("No methods to remove.")
+        await update.message.reply_text("কোনো method নেই।")
         return
-    context.user_data.clear()
-    context.user_data["remove_method"] = True
-    msg = "🗑 Send method name to remove:\n\n"
+    set_state(context, ADMIN_REMOVE_METHOD)
+    msg = "🗑 সরাতে চাওয়া method এর নাম পাঠান:\n\n"
     for m in methods:
         msg += f"• {m['method_name']}\n"
     await update.message.reply_text(msg, reply_markup=get_back_keyboard())
 
-async def process_remove_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def remove_method_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
-    method = await run_db_query("SELECT method_name FROM withdraw_methods WHERE method_name=?", (name,), "one")
+    method = await run_db(
+        "SELECT method_name FROM withdraw_methods WHERE method_name=?", (name,), "one"
+    )
     if not method:
-        await update.message.reply_text("❌ Method not found.")
+        await update.message.reply_text("❌ Method পাওয়া যায়নি।")
     else:
-        await run_db_query("DELETE FROM withdraw_methods WHERE method_name=?", (name,))
-        await update.message.reply_text(f"✅ Method *{name}* removed!", parse_mode="Markdown", reply_markup=get_admin_keyboard())
-    context.user_data.clear()
+        await run_db("DELETE FROM withdraw_methods WHERE method_name=?", (name,))
+        await update.message.reply_text(
+            f"✅ Method *{name}* সরানো হয়েছে!",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard(),
+        )
+    clear_state(context)
+
 
 async def method_limits_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    methods = await run_db_query("SELECT * FROM withdraw_methods", fetch="all")
+    methods = await run_db("SELECT * FROM withdraw_methods", fetch="all")
     if not methods:
-        await update.message.reply_text("No methods configured.")
+        await update.message.reply_text("কোনো method নেই।")
         return
-    context.user_data.clear()
-    context.user_data["method_limits"] = "select"
-    msg = "⚙️ *Method Limits* — Send method name to edit:\n\n"
+    set_state(context, ADMIN_METHOD_LIMITS_SEL)
+    msg = "⚙️ *Method Limits* — edit করতে method এর নাম পাঠান:\n\n"
     for m in methods:
         mx = f"Max: {m['max_amount']:.0f}" if float(m["max_amount"]) > 0 else "No max"
         status = "✅" if m["enabled"] else "❌"
         msg += f"{status} *{m['method_name']}* | Min: {m['min_amount']:.0f} | {mx}\n"
-    msg += "\nSend a method name:"
+    msg += "\nMethod এর নাম পাঠান:"
     await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_back_keyboard())
 
-async def method_limits_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    step = context.user_data.get("method_limits")
-    text = update.message.text.strip()
 
-    if step == "select":
-        method = await run_db_query("SELECT * FROM withdraw_methods WHERE method_name=?", (text,), "one")
-        if not method:
-            await update.message.reply_text("❌ Method not found.")
-            context.user_data.clear()
-            return
-        context.user_data["edit_method_name"] = text
-        context.user_data["method_limits"] = "action"
-        await update.message.reply_text(
-            f"⚙️ Editing *{text}*\n\n"
-            f"Send action:\n"
-            f"• `min AMOUNT` — Set min amount\n"
-            f"• `max AMOUNT` — Set max (0 = no limit)\n"
-            f"• `enable` — Enable method\n"
-            f"• `disable` — Disable method",
-            parse_mode="Markdown"
-        )
-    elif step == "action":
-        name = context.user_data.get("edit_method_name")
-        parts = text.lower().split()
-        if parts[0] == "min" and len(parts) == 2:
-            try:
-                await run_db_query("UPDATE withdraw_methods SET min_amount=? WHERE method_name=?", (float(parts[1]), name))
-                await update.message.reply_text(f"✅ Min for *{name}* set to `{parts[1]}`.", parse_mode="Markdown")
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount.")
-        elif parts[0] == "max" and len(parts) == 2:
-            try:
-                await run_db_query("UPDATE withdraw_methods SET max_amount=? WHERE method_name=?", (float(parts[1]), name))
-                await update.message.reply_text(f"✅ Max for *{name}* set to `{parts[1]}`.", parse_mode="Markdown")
-            except ValueError:
-                await update.message.reply_text("❌ Invalid amount.")
-        elif parts[0] == "enable":
-            await run_db_query("UPDATE withdraw_methods SET enabled=1 WHERE method_name=?", (name,))
-            await update.message.reply_text(f"✅ *{name}* enabled.", parse_mode="Markdown")
-        elif parts[0] == "disable":
-            await run_db_query("UPDATE withdraw_methods SET enabled=0 WHERE method_name=?", (name,))
-            await update.message.reply_text(f"✅ *{name}* disabled.", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("❌ Unknown action.")
-        context.user_data.clear()
+async def method_limits_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    method = await run_db(
+        "SELECT * FROM withdraw_methods WHERE method_name=?", (name,), "one"
+    )
+    if not method:
+        await update.message.reply_text("❌ Method পাওয়া যায়নি।")
+        clear_state(context)
+        return
+    context.user_data["_state"] = ADMIN_METHOD_LIMITS_ACT
+    context.user_data["edit_method"] = name
+    await update.message.reply_text(
+        f"⚙️ Editing *{name}*\n\n"
+        f"Action পাঠান:\n"
+        f"• `min AMOUNT` — Minimum set করুন\n"
+        f"• `max AMOUNT` — Maximum set করুন (0 = no limit)\n"
+        f"• `enable` — Enable করুন\n"
+        f"• `disable` — Disable করুন",
+        parse_mode="Markdown",
+    )
+
+
+async def method_limits_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data.get("edit_method")
+    parts = update.message.text.lower().split()
+    if parts[0] == "min" and len(parts) == 2:
+        try:
+            await run_db(
+                "UPDATE withdraw_methods SET min_amount=? WHERE method_name=?",
+                (float(parts[1]), name),
+            )
+            await update.message.reply_text(
+                f"✅ *{name}* এর min `{parts[1]}` set হয়েছে।", parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount।")
+    elif parts[0] == "max" and len(parts) == 2:
+        try:
+            await run_db(
+                "UPDATE withdraw_methods SET max_amount=? WHERE method_name=?",
+                (float(parts[1]), name),
+            )
+            await update.message.reply_text(
+                f"✅ *{name}* এর max `{parts[1]}` set হয়েছে।", parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount।")
+    elif parts[0] == "enable":
+        await run_db("UPDATE withdraw_methods SET enabled=1 WHERE method_name=?", (name,))
+        await update.message.reply_text(f"✅ *{name}* enabled।", parse_mode="Markdown")
+    elif parts[0] == "disable":
+        await run_db("UPDATE withdraw_methods SET enabled=0 WHERE method_name=?", (name,))
+        await update.message.reply_text(f"✅ *{name}* disabled।", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Unknown action।")
+    clear_state(context)
+
 
 # --- Toggle Withdraw ---
 async def toggle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1061,63 +1497,85 @@ async def toggle_withdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_val = "false" if current == "true" else "true"
     await set_setting("withdraw_enabled", new_val)
     status = "✅ ENABLED" if new_val == "true" else "❌ DISABLED"
-    await update.message.reply_text(f"Withdrawals are now: *{status}*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    await update.message.reply_text(
+        f"Withdrawals এখন: *{status}*",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard(),
+    )
+
 
 # --- Min Withdraw ---
 async def set_min_withdraw_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["set_min"] = True
     current = await get_setting("min_withdraw", "10")
+    set_state(context, ADMIN_SET_MIN_WD)
     await update.message.reply_text(
-        f"💰 Current global min withdraw: `{current}` coins\n\nEnter new minimum:",
-        parse_mode="Markdown", reply_markup=get_back_keyboard()
+        f"💰 Current global min withdraw: `{current}` coins\n\nনতুন minimum লিখুন:",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
     )
+
 
 async def process_set_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(update.message.text)
         await set_setting("min_withdraw", str(amount))
-        await update.message.reply_text(f"✅ Global min withdraw set to `{amount:.2f}` coins.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(
+            f"✅ Global min withdraw `{amount:.2f}` coins set হয়েছে।",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard(),
+        )
+        clear_state(context)
     except ValueError:
-        await update.message.reply_text("❌ Invalid amount.")
-    context.user_data.clear()
+        await update.message.reply_text("❌ Invalid amount।")
+
 
 # --- Referral Bonus ---
 async def set_referral_bonus_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["set_bonus"] = True
     current = await get_setting("referral_bonus", "5")
+    set_state(context, ADMIN_SET_BONUS)
     await update.message.reply_text(
-        f"👥 Current referral bonus: `{current}` coins\n\nEnter new bonus:",
-        parse_mode="Markdown", reply_markup=get_back_keyboard()
+        f"👥 Current referral bonus: `{current}` coins\n\nনতুন bonus লিখুন:",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
     )
+
 
 async def process_set_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(update.message.text)
         await set_setting("referral_bonus", str(amount))
-        await update.message.reply_text(f"✅ Referral bonus set to `{amount:.2f}` coins.", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        await update.message.reply_text(
+            f"✅ Referral bonus `{amount:.2f}` coins set হয়েছে।",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard(),
+        )
+        clear_state(context)
     except ValueError:
-        await update.message.reply_text("❌ Invalid amount.")
-    context.user_data.clear()
+        await update.message.reply_text("❌ Invalid amount।")
+
 
 # --- Set Support ---
 async def set_support_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    context.user_data["set_support"] = True
     current = await get_setting("support_username", "")
+    set_state(context, ADMIN_SET_SUPPORT)
     await update.message.reply_text(
-        f"📞 Current support: @{current or 'Not set'}\n\nEnter support username (e.g. @support_user):",
-        parse_mode="Markdown", reply_markup=get_back_keyboard()
+        f"📞 Current support: @{current or 'Set করা নেই'}\n\n"
+        f"Support username লিখুন (যেমন: @support_user):",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard(),
     )
+
 
 async def process_set_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.message.text.replace("@", "").strip()
     await set_setting("support_username", username)
-    await update.message.reply_text(f"✅ Support username set to @{username}", reply_markup=get_admin_keyboard())
-    context.user_data.clear()
+    await update.message.reply_text(
+        f"✅ Support username @{username} set হয়েছে।", reply_markup=get_admin_keyboard()
+    )
+    clear_state(context)
 
-# ==================== START COMMAND ====================
+
+# ==================== /start COMMAND ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ref = None
@@ -1127,184 +1585,188 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (ValueError, IndexError):
             ref = None
 
-    if not await check_force_join(user.id, context):
-        await show_force_join_message(update, context)
+    joined, missing = await check_force_join(user.id, context)
+    if not joined:
+        # Save ref for after join
+        context.user_data["_ref"] = ref
+        await show_force_join_message(update, context, missing)
         return
 
     await register_user(user.id, user.username, user.full_name, ref)
-    context.user_data.clear()
+    clear_state(context)
 
     balance = await get_user_balance(user.id)
+
+    # Check if user is banned
+    user_row = await run_db("SELECT is_banned FROM users WHERE user_id=?", (user.id,), "one")
+    if user_row and user_row["is_banned"]:
+        await update.message.reply_text("🚫 আপনি এই bot থেকে বাদ দেওয়া হয়েছেন।")
+        return
+
     await update.message.reply_text(
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        f"💰 Your balance: `{balance:.2f}` coins\n\n"
-        f"Complete tasks, refer friends, and earn coins!\n"
-        f"Use the menu below to get started. 🚀",
+        f"👋 *স্বাগতম, {user.first_name}!*\n\n"
+        f"💰 আপনার balance: `{balance:.2f}` coins\n\n"
+        f"টাস্ক করুন, বন্ধুদের Invite করুন এবং coins আয় করুন! 🚀",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard(is_admin(user.id))
+        reply_markup=get_main_keyboard(is_admin(user.id)),
     )
 
-# ==================== TASK COMMANDS ====================
-async def handle_task_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    text = update.message.text
-    if not text.startswith("/do_"):
-        return
-    try:
-        task_id = int(text.split("_")[1])
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Invalid task command.")
-        return
 
-    if not await check_force_join(update.effective_user.id, context):
-        await show_force_join_message(update, context)
-        return
-
-    existing = await run_db_query(
-        "SELECT id FROM submissions WHERE user_id=? AND task_id=? AND status IN ('pending','approved')",
-        (update.effective_user.id, task_id), "one"
-    )
-    if existing:
-        await update.message.reply_text("⚠️ You already submitted this task!")
-        return
-
-    task = await run_db_query("SELECT title FROM tasks WHERE id=? AND enabled=1", (task_id,), "one")
-    if not task:
-        await update.message.reply_text("❌ Task not found.")
-        return
-
-    context.user_data["current_task"] = task_id
-    context.user_data["state"] = "waiting_screenshot"
-    await update.message.reply_text(
-        f"📸 Task: *{task['title']}*\n\nPlease send a screenshot as proof of completion:",
-        parse_mode="Markdown", reply_markup=get_back_keyboard()
-    )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != "waiting_screenshot":
-        return
-    task_id = context.user_data.get("current_task")
-    if not task_id:
-        return
-    uid = update.effective_user.id
-    photo = update.message.photo[-1].file_id
-    await run_db_query(
-        "INSERT INTO submissions (user_id, task_id, screenshot_file_id) VALUES (?,?,?)",
-        (uid, task_id, photo)
-    )
-    sub_row = await run_db_query(
-        "SELECT id FROM submissions WHERE user_id=? AND task_id=? ORDER BY id DESC",
-        (uid, task_id), "one"
-    )
-    sub_id = sub_row["id"] if sub_row else "?"
-    await update.message.reply_text(
-        "✅ *Task submitted for review!*\nYou'll be notified once approved.",
-        parse_mode="Markdown", reply_markup=get_main_keyboard(is_admin(uid))
-    )
-    context.user_data.clear()
-    for admin_id in ADMIN_USER_IDS:
-        try:
-            task = await run_db_query("SELECT title FROM tasks WHERE id=?", (task_id,), "one")
-            await context.bot.send_photo(
-                admin_id, photo,
-                caption=(
-                    f"📝 *New Task Submission!*\n\n"
-                    f"👤 User: `{uid}`\n"
-                    f"📋 Task: {task['title'] if task else task_id}\n"
-                    f"🆔 Sub ID: `{sub_id}`\n\n"
-                    f"Reply with:\n✅ `approve {sub_id}`\n❌ `reject {sub_id}`"
-                ),
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
-
-# ==================== MESSAGE HANDLER ====================
+# ==================== MAIN MESSAGE HANDLER ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    text = update.message.text
+    text = update.message.text.strip()
     uid = update.effective_user.id
+    state = get_state(context)
 
-    # Back / Home always work
+    # --- Back / Home ---
     if text in ("🔙 Back", "🏠 Home"):
         await show_main_menu(update, context)
         return
 
-    # Check ban
-    user_row = await run_db_query("SELECT is_banned FROM users WHERE user_id=?", (uid,), "one")
+    # --- Check ban ---
+    user_row = await run_db("SELECT is_banned FROM users WHERE user_id=?", (uid,), "one")
     if user_row and user_row["is_banned"]:
-        await update.message.reply_text("🚫 You are banned from using this bot.")
+        await update.message.reply_text("🚫 আপনি এই bot থেকে বাদ দেওয়া হয়েছেন।")
         return
 
-    # Force join (skip for admins)
-    if not is_admin(uid) and not await check_force_join(uid, context):
-        await show_force_join_message(update, context)
+    # --- Force join (skip for admins) ---
+    if not is_admin(uid):
+        joined, missing = await check_force_join(uid, context)
+        if not joined:
+            await show_force_join_message(update, context, missing)
+            return
+
+    # ================================================================
+    # STATE MACHINE
+    # ================================================================
+
+    # --- Withdraw states ---
+    if state == WD_METHOD:
+        await process_withdraw_method(update, context)
+        return
+    if state == WD_AMOUNT:
+        await process_withdraw_amount(update, context)
+        return
+    if state == WD_ACCOUNT:
+        await process_withdraw_account(update, context)
         return
 
-    # ---- Active state flows ----
-    if context.user_data.get("withdraw_state"):
-        await process_withdraw(update, context)
-        return
-    if context.user_data.get("redeem_state"):
+    # --- Redeem ---
+    if state == REDEEM:
         await process_redeem(update, context)
         return
-    if context.user_data.get("add_task_step"):
-        await add_task_process(update, context)
-        return
-    if context.user_data.get("remove_task"):
-        await remove_task_process(update, context)
-        return
-    if context.user_data.get("submission_action"):
-        await process_submission(update, context)
-        return
-    if context.user_data.get("withdraw_action"):
-        await process_withdraw_admin(update, context)
-        return
-    if context.user_data.get("gift_step"):
-        await process_gift_code(update, context)
-        return
-    if context.user_data.get("broadcast"):
-        await process_broadcast(update, context)
-        return
-    if context.user_data.get("add_channel"):
-        await process_add_channel(update, context)
-        return
-    if context.user_data.get("remove_channel"):
-        await process_remove_channel(update, context)
-        return
-    if context.user_data.get("add_method_step"):
-        await add_method_process(update, context)
-        return
-    if context.user_data.get("remove_method"):
-        await process_remove_method(update, context)
-        return
-    if context.user_data.get("method_limits"):
-        await method_limits_process(update, context)
-        return
-    if context.user_data.get("set_min"):
-        await process_set_min(update, context)
-        return
-    if context.user_data.get("set_bonus"):
-        await process_set_bonus(update, context)
-        return
-    if context.user_data.get("set_support"):
-        await process_set_support(update, context)
-        return
-    if context.user_data.get("manage_user"):
-        await manage_user_process(update, context)
-        return
-    if context.user_data.get("awaiting_task_id"):
-        context.user_data.pop("awaiting_task_id", None)
+
+    # --- Task list ---
+    if state == TASK_LIST:
         try:
-            await show_task_detail(update, context, int(text))
+            tid = int(text)
+            clear_state(context)
+            await show_task_detail(update, context, tid)
         except ValueError:
-            await update.message.reply_text("❌ Invalid task ID.")
+            await update.message.reply_text("❌ সঠিক Task ID লিখুন।")
         return
 
-    # ---- Main menu buttons ----
+    # --- Admin: Add Task ---
+    if state == ADMIN_ADD_TASK_TITLE:
+        await add_task_title(update, context)
+        return
+    if state == ADMIN_ADD_TASK_DESC:
+        await add_task_desc(update, context)
+        return
+    if state == ADMIN_ADD_TASK_LINK:
+        await add_task_link(update, context)
+        return
+    if state == ADMIN_ADD_TASK_REWARD:
+        await add_task_reward(update, context)
+        return
+
+    # --- Admin: Remove Task ---
+    if state == ADMIN_REMOVE_TASK:
+        await remove_task_process(update, context)
+        return
+
+    # --- Admin: Pending Submissions ---
+    if state == ADMIN_PENDING_SUBS:
+        await process_submission_action(update, context)
+        return
+
+    # --- Admin: Withdraw requests ---
+    if state == ADMIN_PENDING_WD:
+        await process_withdraw_admin(update, context)
+        return
+
+    # --- Admin: Gift code ---
+    if state == ADMIN_GIFT_REWARD:
+        await gift_reward(update, context)
+        return
+    if state == ADMIN_GIFT_LIMIT:
+        await gift_limit(update, context)
+        return
+    if state == ADMIN_GIFT_EXPIRY:
+        await gift_expiry(update, context)
+        return
+
+    # --- Admin: Broadcast ---
+    if state == ADMIN_BROADCAST:
+        await process_broadcast(update, context)
+        return
+
+    # --- Admin: Manage User ---
+    if state == ADMIN_MANAGE_USER_ID:
+        await manage_user_id(update, context)
+        return
+    if state == ADMIN_MANAGE_USER_ACT:
+        await manage_user_action(update, context)
+        return
+
+    # --- Admin: Channels ---
+    if state == ADMIN_ADD_CHANNEL:
+        await add_channel_process(update, context)
+        return
+    if state == ADMIN_REMOVE_CHANNEL:
+        await remove_channel_process(update, context)
+        return
+
+    # --- Admin: Methods ---
+    if state == ADMIN_ADD_METHOD_NAME:
+        await add_method_name(update, context)
+        return
+    if state == ADMIN_ADD_METHOD_MIN:
+        await add_method_min(update, context)
+        return
+    if state == ADMIN_ADD_METHOD_MAX:
+        await add_method_max(update, context)
+        return
+    if state == ADMIN_ADD_METHOD_INST:
+        await add_method_inst(update, context)
+        return
+    if state == ADMIN_REMOVE_METHOD:
+        await remove_method_process(update, context)
+        return
+    if state == ADMIN_METHOD_LIMITS_SEL:
+        await method_limits_select(update, context)
+        return
+    if state == ADMIN_METHOD_LIMITS_ACT:
+        await method_limits_action(update, context)
+        return
+
+    # --- Admin: Settings ---
+    if state == ADMIN_SET_MIN_WD:
+        await process_set_min(update, context)
+        return
+    if state == ADMIN_SET_BONUS:
+        await process_set_bonus(update, context)
+        return
+    if state == ADMIN_SET_SUPPORT:
+        await process_set_support(update, context)
+        return
+
+    # ================================================================
+    # MENU BUTTONS
+    # ================================================================
     if text == "👤 Account":
         await show_account(update, context)
     elif text == "💰 Wallet":
@@ -1369,21 +1831,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await show_main_menu(update, context)
 
+
 # ==================== MAIN ====================
 async def main():
     await init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex(r"^/do_\d+$"), handle_task_command))
+
+    # /do_X task command
+    app.add_handler(
+        MessageHandler(filters.Regex(r"^/do_\d+$"), handle_task_command)
+    )
+
+    # Callback query (force join check button)
+    app.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
+
+    # Photo handler
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # All text messages
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
 
     logger.info("🤖 Bot started successfully!")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
