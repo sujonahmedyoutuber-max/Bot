@@ -1,8 +1,9 @@
 """
-Telegram Task & Reward Bot - Complete Working Code for Railway
+Telegram Task & Reward Bot - Complete Working Code
 ✅ Only ReplyKeyboardMarkup (No InlineKeyboardMarkup)
 ✅ Universal Back/Home Navigation
 ✅ ALL Admin commands via buttons
+✅ Force Join with Channel Display
 ✅ Ready for Railway Deployment
 """
 
@@ -214,19 +215,106 @@ async def register_user(user_id: int, username: str = None, full_name: str = Non
             (referred_by, user_id)
         )
 
-async def force_join_passed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
+# ==================== FORCE JOIN FUNCTIONS ====================
+async def force_join_passed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+    """
+    Check if user has joined all required channels.
+    Returns: (passed: bool, not_joined_channels: list)
+    """
+    channels = await run_db_query("SELECT channel_username, invite_link FROM channels", fetch="all")
     if not channels:
-        return True
+        return True, []
+    
+    not_joined = []
     for row in channels:
         username = row["channel_username"]
         try:
             chat_member = await context.bot.get_chat_member(f"@{username}", user_id)
             if chat_member.status in ["left", "kicked"]:
-                return False
+                not_joined.append(dict(row))
         except Exception:
-            return False
-    return True
+            not_joined.append(dict(row))
+    
+    return len(not_joined) == 0, not_joined
+
+async def show_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user which channels they need to join"""
+    user_id = update.effective_user.id
+    passed, not_joined = await force_join_passed(user_id, context)
+    
+    if passed:
+        return True
+    
+    # Build message with channel links
+    message = "⚠️ *Access Denied!*\n\n"
+    message += "You must join the following channel(s) to use this bot:\n\n"
+    
+    for channel in not_joined:
+        if channel.get("invite_link"):
+            message += f"📢 [{channel['channel_username']}]({channel['invite_link']})\n"
+        else:
+            message += f"📢 @{channel['channel_username']}\n"
+    
+    message += "\n*After joining, click '✅ I've Joined' button below*"
+    
+    # Create keyboard with join buttons
+    buttons = []
+    for channel in not_joined:
+        if channel.get("invite_link"):
+            buttons.append([KeyboardButton(f"🔗 Join @{channel['channel_username']}")])
+        else:
+            buttons.append([KeyboardButton(f"📢 @{channel['channel_username']}")])
+    
+    buttons.append([KeyboardButton("✅ I've Joined"), KeyboardButton("🔄 Check Again")])
+    
+    reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        message, 
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+        disable_web_page_preview=True
+    )
+    return False
+
+async def check_force_join_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 'Check Again' or 'I've Joined' button"""
+    user_id = update.effective_user.id
+    passed, not_joined = await force_join_passed(user_id, context)
+    
+    if passed:
+        await update.message.reply_text(
+            "✅ Welcome! You have joined all required channels.",
+            reply_markup=get_main_keyboard(is_admin(user_id))
+        )
+        # Register or show main menu
+        user = update.effective_user
+        await register_user(user_id, user.username, user.full_name, None)
+        return True
+    else:
+        # Show which channels still not joined
+        message = "⚠️ *Still missing these channels:*\n\n"
+        for channel in not_joined:
+            message += f"• @{channel['channel_username']}\n"
+        message += "\nPlease join and click '✅ I've Joined'"
+        
+        # Recreate keyboard
+        buttons = []
+        for channel in not_joined:
+            if channel.get("invite_link"):
+                buttons.append([KeyboardButton(f"🔗 Join @{channel['channel_username']}")])
+            else:
+                buttons.append([KeyboardButton(f"📢 @{channel['channel_username']}")])
+        
+        buttons.append([KeyboardButton("✅ I've Joined"), KeyboardButton("🔄 Check Again")])
+        reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
+        return False
 
 # ==================== KEYBOARDS ====================
 def get_main_keyboard(is_admin_user: bool = False) -> ReplyKeyboardMarkup:
@@ -393,6 +481,25 @@ async def show_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await push_history(update, context, "invite")
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
 
+async def channel_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels = await run_db_query("SELECT channel_username, invite_link FROM channels", fetch="all")
+    if not channels:
+        text = "📢 No required channels configured."
+    else:
+        text = "📢 *Required Channels:*\nPlease join these channels to use the bot:\n\n"
+        for ch in channels:
+            if ch['invite_link']:
+                text += f"• [{ch['channel_username']}]({ch['invite_link']})\n"
+            else:
+                text += f"• @{ch['channel_username']}\n"
+    await push_history(update, context, "channel")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard(), disable_web_page_preview=True)
+
+async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = "🆘 *Support*\n\nFor any issues or inquiries, contact admin.\n\nResponse time: 24-48 hours"
+    await push_history(update, context, "support")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
+
 # ==================== TASKS SYSTEM ====================
 async def show_tasks_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks = await run_db_query("SELECT * FROM tasks WHERE enabled=1 ORDER BY id", fetch="all")
@@ -419,7 +526,7 @@ async def show_task_details(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             f"Description: {task['description']}\n"
             f"Reward: {task['reward']:.2f} coins\n"
             f"Photo: {task['photo_url'] or 'No photo'}\n\n"
-            f"Click /start_task to begin this task.")
+            f"Send /start_task to begin this task.")
     await push_history(update, context, "task_details", {"task_id": task_id})
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
     context.user_data["current_task"] = task_id
@@ -573,23 +680,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await push_history(update, context, "leaderboard")
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
 
-# ==================== CHANNEL & SUPPORT ====================
-async def channel_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channels = await run_db_query("SELECT channel_username, invite_link FROM channels", fetch="all")
-    if not channels:
-        text = "📢 No required channels configured."
-    else:
-        text = "📢 *Required Channels:*\nPlease join these channels to use the bot:\n\n"
-        for ch in channels:
-            text += f"• @{ch['channel_username']}\n"
-    await push_history(update, context, "channel")
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
-
-async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "🆘 *Support*\n\nFor any issues or inquiries, contact admin.\n\nResponse time: 24-48 hours"
-    await push_history(update, context, "support")
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_back_home_keyboard())
-
 # ==================== ADMIN PANEL ====================
 async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -598,7 +688,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await push_history(update, context, "admin_panel")
     await update.message.reply_text("🔧 *Admin Panel* - Choose an option:", parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
-# ==================== BOT SETTINGS (All via buttons) ====================
+# ==================== BOT SETTINGS ====================
 async def bot_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -677,7 +767,14 @@ async def add_channel_button(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(update.effective_user.id):
         return
     context.user_data["force_join_action"] = "add_channel"
-    await update.message.reply_text("➕ Send the channel username (e.g., @mychannel):", reply_markup=get_back_home_keyboard())
+    context.user_data["force_join_step"] = "waiting_username"
+    await update.message.reply_text(
+        "➕ *Add Force Join Channel*\n\n"
+        "Send the channel username (e.g., @mychannel):\n\n"
+        "⚠️ Make sure the bot is admin of that channel!",
+        parse_mode="Markdown",
+        reply_markup=get_back_home_keyboard()
+    )
 
 async def remove_channel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -689,32 +786,74 @@ async def list_channels_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_admin(update.effective_user.id):
         return
     
-    channels = await run_db_query("SELECT channel_username FROM channels", fetch="all")
+    channels = await run_db_query("SELECT channel_username, invite_link FROM channels", fetch="all")
     if not channels:
-        text = "📭 No channels in force join list."
+        text = "📭 *No channels in force join list.*\n\nUse '➕ Add Channel' to add one."
     else:
         text = "📋 *Force Join Channels:*\n\n"
         for ch in channels:
             text += f"• @{ch['channel_username']}\n"
+            if ch['invite_link']:
+                text += f"  Link: {ch['invite_link']}\n"
+            text += "\n"
     
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_force_join_keyboard())
 
 async def handle_force_join_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = context.user_data.get("force_join_action")
+    step = context.user_data.get("force_join_step")
+    
     if not action:
         return
     
-    username = update.message.text.replace("@", "").strip()
-    
     if action == "add_channel":
-        await run_db_query("INSERT OR IGNORE INTO channels (channel_username) VALUES (?)", (username,))
-        await update.message.reply_text(f"✅ Channel @{username} added to force join list.")
-    elif action == "remove_channel":
-        await run_db_query("DELETE FROM channels WHERE channel_username=?", (username,))
-        await update.message.reply_text(f"✅ Channel @{username} removed from force join list.")
+        if step == "waiting_username":
+            username = update.message.text.replace("@", "").strip()
+            if not username:
+                await update.message.reply_text("❌ Invalid channel username.")
+                return
+            
+            context.user_data["temp_channel"] = username
+            context.user_data["force_join_step"] = "waiting_invite_link"
+            await update.message.reply_text(
+                f"✅ Channel @{username} added.\n\n"
+                "Now send the invite link (or type 'skip'):\n"
+                "Example: https://t.me/joinchat/xxxxx",
+                reply_markup=get_back_home_keyboard()
+            )
+        
+        elif step == "waiting_invite_link":
+            username = context.user_data["temp_channel"]
+            invite_link = update.message.text.strip()
+            
+            if invite_link.lower() == "skip":
+                invite_link = None
+            
+            await run_db_query(
+                "INSERT OR REPLACE INTO channels (channel_username, invite_link) VALUES (?, ?)",
+                (username, invite_link)
+            )
+            
+            await update.message.reply_text(
+                f"✅ Channel @{username} added to force join list!\n\n"
+                f"Invite Link: {invite_link or 'Not provided'}",
+                reply_markup=get_force_join_keyboard()
+            )
+            
+            context.user_data.pop("force_join_action", None)
+            context.user_data.pop("force_join_step", None)
+            context.user_data.pop("temp_channel", None)
+            await admin_force_join(update, context)
     
-    context.user_data.pop("force_join_action", None)
-    await admin_force_join(update, context)
+    elif action == "remove_channel":
+        username = update.message.text.replace("@", "").strip()
+        await run_db_query("DELETE FROM channels WHERE channel_username=?", (username,))
+        await update.message.reply_text(
+            f"✅ Channel @{username} removed from force join list.",
+            reply_markup=get_force_join_keyboard()
+        )
+        context.user_data.pop("force_join_action", None)
+        await admin_force_join(update, context)
 
 # ==================== USER MANAGEMENT ====================
 async def user_management(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1120,10 +1259,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].startswith("ref_"):
         ref = int(context.args[0].split("_")[1])
     
-    if not await force_join_passed(user_id, context):
-        await update.message.reply_text("⚠️ Please join our required channels first to use the bot.")
+    # Check force join first
+    passed, not_joined = await force_join_passed(user_id, context)
+    
+    if not passed:
+        # Show force join message with channel list
+        message = "⚠️ *Access Denied!*\n\n"
+        message += "You must join the following channel(s) to use this bot:\n\n"
+        
+        for channel in not_joined:
+            if channel.get("invite_link"):
+                message += f"📢 [{channel['channel_username']}]({channel['invite_link']})\n"
+            else:
+                message += f"📢 @{channel['channel_username']}\n"
+        
+        message += "\n*After joining, click '✅ I've Joined' button below*"
+        
+        # Create keyboard
+        buttons = []
+        for channel in not_joined:
+            if channel.get("invite_link"):
+                buttons.append([KeyboardButton(f"🔗 Join @{channel['channel_username']}")])
+            else:
+                buttons.append([KeyboardButton(f"📢 @{channel['channel_username']}")])
+        
+        buttons.append([KeyboardButton("✅ I've Joined"), KeyboardButton("🔄 Check Again")])
+        
+        reply_markup = ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            message,
+            parse_mode="Markdown",
+            reply_markup=reply_markup,
+            disable_web_page_preview=True
+        )
         return
     
+    # If force join passed, register user
     await register_user(user_id, user.username, user.full_name, ref)
     await show_main_menu(update, context)
 
@@ -1135,6 +1307,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     user_id = update.effective_user.id
     state = context.user_data.get("state")
+    
+    # Handle force join buttons
+    if text == "✅ I've Joined" or text == "🔄 Check Again":
+        await check_force_join_button(update, context)
+        return
+    
+    # Handle channel join buttons
+    if text.startswith("🔗 Join @") or text.startswith("📢 @"):
+        channel = text.replace("🔗 Join @", "").replace("📢 @", "")
+        await update.message.reply_text(
+            f"Please join @{channel} first, then click '✅ I've Joined'",
+            reply_markup=update.message.reply_markup
+        )
+        return
     
     # Handle setting value inputs
     if context.user_data.get("setting_action"):
